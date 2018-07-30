@@ -1,9 +1,10 @@
 """
 
 """
-from tensorflow.python.client import device_lib
 
 import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 
 def load(path):
@@ -11,26 +12,29 @@ def load(path):
     return np.load(file=path)
 
 
-def query_memory():
-    """Queries the available memory."""
-    local_device_protos = device_lib.list_local_devices()
-    return [x.memory_limit for x in local_device_protos
-            if x.device_type == 'GPU']
+def save(path, data):
+    """Saves a numpy array"""
+    np.save(file=path, arr=data)
 
 
-def prepare_shards(size, dim):
-    """Prepares the number of shards to divide the data into."""
-    available_memory = query_memory()
+def plot(history, data, labels, centroids):
+    """Plots the history of the Mean Shift clustering."""
 
-    # TODO multi-gpu use
-    available_memory = available_memory[0]
-    required_memory = 4 * size ** 2 * dim
+    def _draw_line(p1, p2):
+        plt.plot([p1[0], p2[0]], [p1[1], p2[1]],
+                 color='orange', linewidth=0.6, zorder=1)
 
-    sharded = (required_memory / available_memory) > 1
-    if not sharded:
-        return False, None
+    draw_line = np.vectorize(lambda p1, p2: _draw_line(p1, p2),
+                             signature='(n),(n)->()')
 
-    shard_size = int(size // (required_memory / available_memory))
-    n_shards = size // [d for d in
-                        range(1, shard_size) if size % d == 0][-1]
-    return True, n_shards
+    grid = sns.jointplot(data[:, 0], data[:, 1], kind="kde")
+    grid.plot_joint(plt.scatter, c=labels, zorder=2)
+
+    for i in range(0, len(history) - 1):
+        draw_line(history[i], history[i + 1])
+
+    plt.scatter(centroids[:, 0], centroids[:, 1],
+                c='white', marker="*", s=100,
+                linewidth=0.8, edgecolor='black', zorder=3)
+
+    plt.show()

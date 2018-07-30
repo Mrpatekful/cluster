@@ -5,10 +5,12 @@
 import tensorflow as tf
 import numpy as np
 
-from utils import prepare_shards
+from tensorflow.python.client import device_lib
 
 
-# Kernel functions:
+# Kernel functions for non-parametric density estimation.
+# In order to be able to use new kernel, it has to also be
+# registered in the MeanShift _kernel_fns dictionary.
 
 def gaussian(x, x_i, h):
     """Gaussian kernel function"""
@@ -19,7 +21,31 @@ def flat(x, x_i):
     return 0
 
 
-class MeanShift:
+class Clustering:
+    """Abstract base class for clustering algorithms."""
+
+    @staticmethod
+    def _nearest(x, c): return tf.argmin(
+        tf.reduce_sum((tf.expand_dims(x, 2) - tf.expand_dims(
+            tf.transpose(c), 0)) ** 2, axis=1), axis=1)
+
+    def __init__(self, dim, criterion, max_iter):
+        """Abstract base class for clustering algorithms."""
+        self._criterion = criterion
+        self._max_iter = max_iter
+        self._dim = dim
+
+    def fit(self, x: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
+
+    def fit_and_predict(self):
+        raise NotImplementedError
+
+    def predict(self, x: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
+
+
+class MeanShift(Clustering):
     """Implementation of mean shift clustering"""
 
     # Available kernel functions
@@ -28,7 +54,8 @@ class MeanShift:
         'flat':      flat
     }
 
-    def __init__(self, dim: int, kernel: str, bandwidth: float,
+    def __init__(self, dim: int, kernel: str,
+                 bandwidth: float,
                  criterion: float = 1e-5,
                  max_iter: int = 100):
         """Mean shift clustering object.
@@ -38,7 +65,9 @@ class MeanShift:
             :param kernel: Kernel function type for mean shift calculation.
             :param bandwidth: Bandwidth hyper parameter of the clustering.
             :param criterion: Convergence criterion.
+            :param max_iter: Maximum number of iterations.
         """
+        super(MeanShift, self).__init__(dim, criterion, max_iter)
 
         assert self._kernel_fns.get(kernel) is not None, 'Invalid kernel.'
         assert bandwidth is not None
@@ -57,14 +86,8 @@ class MeanShift:
         # Initial centroids
         self._i_c = None
 
-        self._criterion = criterion
-        self._max_iter = max_iter
-        self._dim = dim
-        self._merged = None
-
         # Result variables
         self.centroids_ = None
-        self._c_c_tensor = None
         self.history_ = None
         self.n_iter_ = None
         self.m_diff_ = None
@@ -78,7 +101,7 @@ class MeanShift:
         self._x_sh = None
         self._size = None
 
-    def fit(self, x: np.ndarray):
+    def fit(self, x: np.ndarray) -> np.ndarray:
         """Fits the MeanShift cluster object to the given data set.
 
         Arguments:
@@ -103,7 +126,8 @@ class MeanShift:
                 tf.logging.info('Data is too large, fragmenting.'
                                 ' Dividing to {} fragments.'.
                                 format(self._n_shards))
-            crs, hist, it, diff = sess.run(
+
+            crs, self.history_, it, diff = sess.run(
                 [*self._create_fit_graph(), self.n_iter_, self.m_diff_],
                 feed_dict={
                     self.x:    x,
@@ -113,14 +137,14 @@ class MeanShift:
             tf.logging.info('Clustering finished in {} iterations with '
                             '{:.5} error'.format(it, diff))
             tf.logging.info('Proceeding mode selection.')
-            labels, self.centroids_ = self._find_modes(crs, x, sess)
+            _y, self.centroids_ = self._find_modes(crs, sess)
 
-        return labels
+        return _y
 
     def fit_and_predict(self):
         raise NotImplementedError
 
-    def predict(self, x: np.ndarray):
+    def predict(self, x: np.ndarray) -> np.ndarray:
         """Calculates the nearest cluster centroid for the data points.
 
         Arguments:
@@ -140,23 +164,14 @@ class MeanShift:
 
         with tf.Session(config=config) as sess:
             self._size = x.shape[0]
-            self._sharded, self._n_shards = \
-                prepare_shards(x.shape[0], x.shape[1])
             if self._sharded:
                 tf.logging.info('Data is too large, fragmenting.'
                                 ' Dividing to {} fragments.'.
                                 format(self._n_shards))
-            crs, hist, it, diff = sess.run(
-                [*self._create_fit_graph(), self.n_iter_, self.m_diff_],
-                feed_dict={
-                    self.x:    x,
-                    self._i_c: x
-                })
+            labels = sess.run(self._create_predict_graph(),
+                              feed_dict={self.x: x})
 
-            tf.logging.info('Clustering finished in {} iterations with '
-                            '{:.5} error'.format(it, diff))
-            tf.logging.info('Proceeding mode selection.')
-            labels, self.centroids_ = self._find_modes(crs, x, sess)
+        return labels
 
     def _mean_shift(self, i, c, c_h, _):
         """Calculates the mean shift vector and refreshes the centroids."""
@@ -195,33 +210,27 @@ class MeanShift:
 
     def _create_fit_graph(self):
         """Creates the computation graph of the clustering."""
-        with tf.name_scope('init'):
-            self.x = tf.placeholder(
-                tf.float32, [self._size, self._dim], name='data')
-            self._i_c = tf.placeholder(
-                tf.float32, [self._size, self._dim], name='init_c')
+        self.x = tf.placeholder(
+            tf.float32, [self._size, self._dim], name='data')
+        self._i_c = tf.placeholder(
+            tf.float32, [self._size, self._dim], name='init')
 
         if self._sharded:
-            with tf.name_scope('sh_data'):
-                # Sharded version of expanded x and x.T
-                self._x_t_sh = [tf.expand_dims(_x_t, 0)
-                                for _x_t in tf.split(tf.transpose(self.x),
-                                                     self._n_shards, 1)]
-                self._x_sh = [tf.expand_dims(_x, 0)
-                              for _x in tf.split(self.x, self._n_shards, 0)]
+            # Sharded version of expanded x and x.T
+            self._x_t_sh = [tf.expand_dims(_x_t, 0)
+                            for _x_t in tf.split(tf.transpose(self.x),
+                                                 self._n_shards, 1)]
+            self._x_sh = [tf.expand_dims(_x, 0)
+                          for _x in tf.split(self.x, self._n_shards, 0)]
         else:
-            with tf.name_scope('pp_data'):
-                # Normal version of expanded x and x.T
-                self._x_t = tf.expand_dims(tf.transpose(self.x), 0)
-                self._x = tf.expand_dims(self.x, 0)
+            # Normal version of expanded x and x.T
+            self._x_t = tf.expand_dims(tf.transpose(self.x), 0)
+            self._x = tf.expand_dims(self.x, 0)
 
         self._h = tf.constant(self._bandwidth, tf.float32, name='bw')
         i = tf.constant(0, tf.int32)
 
-        # TODO benchmark device placement
-        with tf.device("/cpu:0"):
-            _c_h = tf.TensorArray(dtype=tf.float32, size=self._max_iter,
-                                  infer_shape=False)
+        _c_h = tf.TensorArray(dtype=tf.float32, size=self._max_iter)
         _c_h = _c_h.write(0, self._i_c)
 
         self.m_diff_ = tf.constant(np.inf, tf.float32, name='diff')
@@ -242,9 +251,14 @@ class MeanShift:
         return _c, _c_h
 
     def _create_predict_graph(self):
-        pass
+        """Creates the prediction computation graph."""
+        self.x = tf.placeholder(tf.float32, [None, self._dim], name='data')
+        _c = tf.constant(self.centroids_, dtype=tf.float32, name='centroids')
+        prediction_op = self._nearest(self.x, _c)
 
-    def _find_modes(self, y, x, sess):
+        return prediction_op
+
+    def _find_modes(self, y, sess):
         """Converts the tensor of converged data points to clusters."""
         def _modes(_i, _c, _n_c, _l):
             """Body of the while loop."""
@@ -258,11 +272,6 @@ class MeanShift:
                 return _lt.write(_i, _l), _cp, n
 
             distance = tf.sqrt(tf.reduce_sum((_c - y[_i]) ** 2, axis=1))
-            distance = tf.cond(
-                tf.equal(_i % log_freq, 0),
-                lambda: tf.Print(distance, [_i],
-                                 message='Progress: 100/'),
-                lambda: distance)
             least = tf.cast(tf.argmin(distance), tf.int32)
             value = tf.gather(distance, least)
             _l, _c, _n_c = tf.cond(
@@ -276,8 +285,6 @@ class MeanShift:
         _initial = y[None, 0]
         y = tf.constant(y, dtype=tf.float32)
 
-        log_freq = self._size // 5 if self._size > 10 else 1
-
         # Loop variables:
         #  1. i: Index variable.
         #  2. c: Tensor of discovered centroids (modes).
@@ -289,7 +296,7 @@ class MeanShift:
         n_c = tf.constant(0, dtype=tf.int32)
         _labels = tf.TensorArray(dtype=tf.int32, size=self._size)
 
-        _, centroids, _, labels = tf.while_loop(
+        _, _centroids, _, _labels = tf.while_loop(
             cond=lambda __i, __c, __n_c, __l: tf.less(__i, self._size),
             body=_modes,
             loop_vars=(i, c, n_c, _labels),
@@ -297,12 +304,10 @@ class MeanShift:
                 tf.TensorShape([]),
                 tf.TensorShape([None, self._dim]),
                 tf.TensorShape([]),
-                tf.TensorShape([])
-            )
-        )
+                tf.TensorShape([])))
 
-        labels = labels.gather(tf.range(self._size))
-        labels, centroids = sess.run([labels, centroids])
+        _labels = _labels.gather(tf.range(self._size))
+        labels, centroids = sess.run([_labels, _centroids])
 
         return labels, centroids
 
@@ -315,3 +320,100 @@ class MeanShift:
     def history(self):
         """Property for the history of the cluster centroids."""
         return self.history_
+
+
+class KMeans(Clustering):
+    """Implementation of K-Means clustering."""
+
+    def __init__(self, dim: int,
+                 n_clusters: int,
+                 criterion: float = 1e-5,
+                 max_iter: int = 100):
+        """KMeans clustering object.
+
+        Arguments:
+            :param dim: Dimensionality of the data point vectors.
+            :param n_clusters: The number of clusters (K parameter).
+            :param criterion: Convergence criterion.
+            :param max_iter: Maximum number of iterations.
+        """
+        super(KMeans, self).__init__(dim, criterion, max_iter)
+
+        self._n_clusters = n_clusters
+
+        self.centroids_ = None
+
+    def fit(self, x):
+        raise NotImplementedError
+
+    def fit_and_predict(self):
+        raise NotImplementedError
+
+    def predict(self, x: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
+
+    @property
+    def centroids(self):
+        """Property for the tensor of clusters."""
+        return self.centroids_
+
+
+class MiniBatchKMeans(KMeans):
+    """Implementation of the batched version of K-Means clustering."""
+
+    def __init__(self, dim: int,
+                 batch_size: int,
+                 n_clusters: int,
+                 criterion: float = 1e-5,
+                 max_iter: int = 100):
+        """MiniBatchKMeans clustering object.
+
+        Arguments:
+            :param dim: Dimensionality of the data point vectors.
+            :param n_clusters: The number of clusters (K parameter).
+            :param criterion: Convergence criterion.
+            :param max_iter: Maximum number of iterations.
+        """
+        super(MiniBatchKMeans, self).__init__(dim, n_clusters, criterion,
+                                              max_iter)
+
+        self._batch_size = batch_size
+
+    def fit(self, x):
+        raise NotImplementedError
+
+    def fit_and_predict(self):
+        raise NotImplementedError
+
+    def predict(self, x: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
+
+    @property
+    def centroids(self):
+        """Property for the tensor of clusters."""
+        return self.centroids_
+
+
+def query_memory():
+    """Queries the available memory."""
+    local_device_protos = device_lib.list_local_devices()
+    return [x.memory_limit for x in local_device_protos
+            if x.device_type == 'GPU']
+
+
+def prepare_shards(size, dim):
+    """Prepares the number of shards to divide the data into."""
+    available_memory = query_memory()
+
+    # TODO multi-gpu use
+    available_memory = available_memory[0]
+    required_memory = 4 * size ** 2 * dim
+
+    sharded = (required_memory / available_memory) > 1
+    if not sharded:
+        return False, None
+
+    shard_size = int(size // (required_memory / available_memory))
+    n_shards = size // [d for d in
+                        range(1, shard_size) if size % d == 0][-1]
+    return True, n_shards
