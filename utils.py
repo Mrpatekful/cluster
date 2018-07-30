@@ -12,7 +12,7 @@ def load(path):
 
 
 def query_memory():
-    """Queries the available memory, and devices."""
+    """Queries the available memory."""
     local_device_protos = device_lib.list_local_devices()
     return [x.memory_limit for x in local_device_protos
             if x.device_type == 'GPU']
