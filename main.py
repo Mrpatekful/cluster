@@ -16,11 +16,14 @@ from clustering import MiniBatchKMeans
 from utils import plot
 from utils import load, save
 
+# TODO testing only
+from utils import generate_random
+
 tf.flags.DEFINE_float('bandwidth', None, 'Bandwidth of the kernel.')
 tf.flags.DEFINE_string('data', None, 'Path of the data for clustering.')
 tf.flags.DEFINE_string('kernel', 'gaussian', 'Type of the kernel.')
 tf.flags.DEFINE_float('criterion', 1e-5, 'Convergence criterion.')
-tf.flags.DEFINE_string('method', 'mean_shift', 'Algorithm method.')
+tf.flags.DEFINE_string('method', 'kmeans', 'Algorithm method.')
 tf.flags.DEFINE_string('verbosity', 'INFO', 'Verbosity level.')
 tf.flags.DEFINE_integer('batchsize', None, 'Batch size for mini batch method.')
 tf.flags.DEFINE_integer('maxiter', 1000, 'Maximum number of iterations.')
@@ -41,7 +44,9 @@ def main(_):
 
     assert os.path.exists(tf.flags.FLAGS.data)
 
-    data = load(tf.flags.FLAGS.data)
+    # TODO testing only
+    # data = load(tf.flags.FLAGS.data)
+    data = generate_random()
     dim = data.shape[1]
 
     params = {
@@ -63,22 +68,24 @@ def main(_):
 
         if ms.history is None:
             tf.logging.warn('Data is too large to visualize.')
-        elif not data.shape[1] == 2:
+        elif data.shape[1] != 2:
             tf.logging.warn('Data must be 2 dimensional to visualize.')
         else:
+            tf.logging.info('Creating plot for history visualization.')
             plot(ms.history, data, labels, centroids)
 
     elif tf.flags.FLAGS.method == 'kmeans':
         ms = KMeans(
-            n_clusters=tf.flags.FLAGS.n_clusters,
+            n_clusters=tf.flags.FLAGS.nclusters,
             **params)
 
-        ms.fit(data)
+        labels = ms.fit(data)
         centroids = ms.centroids
+        plot(ms.history, data, labels, centroids)
 
     elif tf.flags.FLAGS.method == 'mini_batch_kmeans':
         ms = MiniBatchKMeans(
-            n_clusters=tf.flags.FLAGS.n_clusters,
+            n_clusters=tf.flags.FLAGS.nclusters,
             batch_size=tf.flags.FLAGS.batchsize,
             **params)
 

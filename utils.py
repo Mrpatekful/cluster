@@ -30,11 +30,22 @@ def plot(history, data, labels, centroids):
     grid = sns.jointplot(data[:, 0], data[:, 1], kind="kde")
     grid.plot_joint(plt.scatter, c=labels, zorder=2)
 
-    for i in range(0, len(history) - 1):
-        draw_line(history[i], history[i + 1])
+    pen = len(history[0]) // 100 if len(history) > 100 else 0
+    step = len(history) // 50 + pen + 1
+    for i in range(0, len(history) - step, step):
+        draw_line(history[i], history[i + step])
 
     plt.scatter(centroids[:, 0], centroids[:, 1],
                 c='white', marker="*", s=100,
                 linewidth=0.8, edgecolor='black', zorder=3)
 
     plt.show()
+
+
+def generate_random():
+    a = np.random.multivariate_normal([1, 1], [[1, 0], [0, 1]], [50])
+    b = np.random.multivariate_normal([-3, -3], [[1, 0], [0, 1]], [50])
+    c = np.random.multivariate_normal([-8, -3], [[1, 0], [0, 1]], [50])
+    data = np.vstack((a, b, c))
+
+    return data
