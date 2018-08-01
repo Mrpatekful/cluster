@@ -30,8 +30,10 @@ def plot(history, data, labels, centroids):
     grid = sns.jointplot(data[:, 0], data[:, 1], kind="kde")
     grid.plot_joint(plt.scatter, c=labels, zorder=2)
 
+    # Speeds up drawing by skipping several history objects
     pen = len(history[0]) // 100 if len(history) > 100 else 0
     step = len(history) // 50 + pen + 1
+
     for i in range(0, len(history) - step, step):
         draw_line(history[i], history[i + step])
 
