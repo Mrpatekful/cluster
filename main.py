@@ -16,17 +16,14 @@ from clustering import MiniBatchKMeans
 from utils import plot
 from utils import load, save
 
-# TODO testing only
-from utils import generate_random
-
 tf.flags.DEFINE_float('bandwidth', None, 'Bandwidth of the kernel.')
 tf.flags.DEFINE_string('data', None, 'Path of the data for clustering.')
 tf.flags.DEFINE_string('kernel', 'gaussian', 'Type of the kernel.')
 tf.flags.DEFINE_float('criterion', 1e-5, 'Convergence criterion.')
-tf.flags.DEFINE_string('method', 'kmeans', 'Algorithm method.')
+tf.flags.DEFINE_string('method', 'mini_batch_kmeans', 'Algorithm method.')
 tf.flags.DEFINE_string('verbosity', 'INFO', 'Verbosity level.')
 tf.flags.DEFINE_integer('batchsize', None, 'Batch size for mini batch method.')
-tf.flags.DEFINE_integer('maxiter', 1000, 'Maximum number of iterations.')
+tf.flags.DEFINE_integer('maxiter', 100, 'Maximum number of iterations.')
 tf.flags.DEFINE_integer('nclusters', None, 'Number of clusters for KMeans.')
 tf.flags.DEFINE_string('save', '.', 'Saves the output to the given directory.')
 
@@ -44,53 +41,38 @@ def main(_):
 
     assert os.path.exists(tf.flags.FLAGS.data)
 
-    # TODO testing only
-    # data = load(tf.flags.FLAGS.data)
-    data = generate_random()
-    dim = data.shape[1]
+    data = load(tf.flags.FLAGS.data)
 
     params = {
-        'dim':          dim,
         'criterion':    tf.flags.FLAGS.criterion,
         'max_iter':     tf.flags.FLAGS.maxiter,
     }
 
-    labels, centroids = None, None
-
     if tf.flags.FLAGS.method == 'mean_shift':
-        ms = MeanShift(
+        cl = MeanShift(
             kernel=tf.flags.FLAGS.kernel,
             bandwidth=tf.flags.FLAGS.bandwidth,
             **params)
 
-        labels = ms.fit(data)
-        centroids = ms.centroids
-
-        if ms.history is None:
-            tf.logging.warn('Data is too large to visualize.')
-        elif data.shape[1] != 2:
-            tf.logging.warn('Data must be 2 dimensional to visualize.')
-        else:
-            tf.logging.info('Creating plot for history visualization.')
-            plot(ms.history, data, labels, centroids)
+        labels = cl.fit(data)
+        centroids = cl.centroids
 
     elif tf.flags.FLAGS.method == 'kmeans':
-        ms = KMeans(
+        cl = KMeans(
             n_clusters=tf.flags.FLAGS.nclusters,
             **params)
 
-        labels = ms.fit(data)
-        centroids = ms.centroids
-        plot(ms.history, data, labels, centroids)
+        labels = cl.fit(data)
+        centroids = cl.centroids
 
     elif tf.flags.FLAGS.method == 'mini_batch_kmeans':
-        ms = MiniBatchKMeans(
+        cl = MiniBatchKMeans(
             n_clusters=tf.flags.FLAGS.nclusters,
             batch_size=tf.flags.FLAGS.batchsize,
             **params)
 
-        ms.fit(data)
-        centroids = ms.centroids
+        labels = cl.fit(data)
+        centroids = cl.centroids
 
     else:
         raise ValueError('--method parameter must either '
@@ -99,6 +81,14 @@ def main(_):
                          '< kmeans > or < mini_batch_kmeans >.')
 
     if labels is not None and centroids is not None:
+        if cl.history is None:
+            tf.logging.warn('Data is too large to visualize.')
+        elif data.shape[1] != 2:
+            tf.logging.warn('Data must be 2 dimensional to visualize.')
+        else:
+            tf.logging.info('Creating plot for history visualization.')
+            plot(cl.history, data, labels, centroids)
+
         save(os.path.join(tf.flags.FLAGS.save, 'centroids.npy'), centroids)
         save(os.path.join(tf.flags.FLAGS.save, 'labels.npy'), labels)
 

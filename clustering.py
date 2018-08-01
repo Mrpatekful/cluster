@@ -19,11 +19,11 @@ class Clustering:
             tf.reduce_sum((tf.expand_dims(a, 2) - tf.expand_dims(
                 tf.transpose(b), 0)) ** 2, axis=1), axis=1), dtype=tf.int32)
 
-    def __init__(self, dim, criterion, max_iter):
+    def __init__(self, criterion, max_iter):
         """Abstract base class for clustering algorithms."""
         self._criterion = criterion
         self._max_iter = max_iter
-        self._dim = dim
+        self._dim = None
 
         # Result variables
         self.centroids_ = None
@@ -80,9 +80,7 @@ class Clustering:
         Returns:
             :return _y: List of labels, in the same order as the provided data.
         """
-        assert x.shape[1] == self._dim, 'Invalid data dimension. Expected' \
-                                        '{} and received {} for axis 1.'.\
-            format(self._dim, x.shape[1])
+        self._dim = x.shape[1]
 
         config = tf.ConfigProto()
         config.gpu_options.allow_growth = False
@@ -107,7 +105,7 @@ class Clustering:
                 })
 
             tf.logging.info('Clustering finished in {} iterations with '
-                            '{:.5} error'.format(it, diff))
+                            '{:.5} shift delta.'.format(it, diff))
             tf.logging.info('Proceeding to post-processing.')
             _y, self.centroids_ = self._post_process(x, _c, sess)
 
@@ -152,15 +150,22 @@ class Clustering:
 # registered in the MeanShift _kernel_fns dictionary.
 
 def _gaussian(x, x_i, h):
-    """Gaussian kernel function"""
+    """Gaussian kernel function. """
     return tf.exp(-tf.linalg.norm((x - x_i) / h, ord=2, axis=1))
 
 
-# TODO test method
-def _flat(x, x_i, h):
-    """Flat kernel function."""
+def _epanechnikov(x, x_i, h):
+    """Epanechnikov kernel function."""
+    norm = tf.linalg.norm((x - x_i) / h, ord=2, axis=1)
+    return tf.multiply(3 / 4 * (1 - norm),
+                       tf.cast(tf.less(norm, 1), tf.float32))
+
+
+def _uniform(x, x_i, h):
+    """Flat kernel function. If the value is within the bounds of
+    the bandwidth, it gets weight 1, otherwise 0."""
     return tf.cast(tf.less(
-        tf.linalg.norm(x - x_i, ord=2, axis=1), h), tf.float32)
+        tf.linalg.norm((x - x_i) / h, ord=2, axis=1), 1), tf.float32)
 
 
 class MeanShift(Clustering):
@@ -168,32 +173,33 @@ class MeanShift(Clustering):
 
     # Available kernel functions
     _kernel_fns = {
-        'gaussian':  _gaussian,
-        'flat':      _flat
+        'gaussian':     _gaussian,
+        'uniform':      _uniform,
+        'epanechnikov': _epanechnikov
     }
 
     # noinspection PyTypeChecker
-    def __init__(self, dim: int, kernel: str,
+    def __init__(self,
                  bandwidth: float,
+                 kernel: str = 'gaussian',
                  criterion: float = 1e-5,
-                 max_iter: int = 100):
+                 max_iter: int = 300):
         """Mean shift clustering object.
 
         Arguments:
-            :param dim: Dimensionality of the data point vectors.
             :param kernel: Kernel function type for mean shift calculation.
             :param bandwidth: Bandwidth hyper parameter of the clustering.
             :param criterion: Convergence criterion.
             :param max_iter: Maximum number of iterations.
         """
-        super(MeanShift, self).__init__(dim, criterion, max_iter)
+        super(MeanShift, self).__init__(criterion, max_iter)
 
         assert self._kernel_fns.get(kernel) is not None, 'Invalid kernel.'
         assert bandwidth is not None
 
         self._kernel_fn = self._kernel_fns[kernel]
         self._bandwidth = bandwidth
-        self._log_freq = max_iter // 10 if max_iter > 10 else 1
+        self._log_freq = max_iter // 20 if max_iter > 10 else 1
 
         # Bandwidth
         self._h = None
@@ -274,6 +280,7 @@ class MeanShift(Clustering):
                 _c,
                 _c_h,
                 self.m_diff_),
+            swap_memory=True,
             maximum_iterations=self._max_iter - 1)
 
         r = 1 if self._sharded else self.n_iter_ + 1
@@ -341,40 +348,34 @@ class MeanShift(Clustering):
 class KMeans(Clustering):
     """Implementation of K-Means clustering."""
 
-    def __init__(self, dim: int,
-                 n_clusters: int,
+    def __init__(self, n_clusters: int,
                  criterion: float = 1e-5,
-                 max_iter: int = 100):
+                 max_iter: int = 300):
         """KMeans clustering object.
 
         Arguments:
-            :param dim: Dimensionality of the data point vectors.
             :param n_clusters: The number of clusters (K parameter).
             :param criterion: Convergence criterion.
             :param max_iter: Maximum number of iterations.
         """
-        super(KMeans, self).__init__(dim, criterion, max_iter)
+        super(KMeans, self).__init__(criterion, max_iter)
 
         assert n_clusters is not None
         self._n_clusters = n_clusters
+        self._n_parallel = 1 if self._sharded else 10
 
     def _kmeans(self, i, c, c_h, _):
         """Calculates the next position of the cluster centroids."""
-
         def step_centroid(_i, _c):
             """Moves the centroid to the cluster mean."""
-            _c_i = tf.where(tf.equal(self._nearest(self.x, c), _i))
-            # TODO null check
-            # s = tf.cond(tf.equal(len(_c), 0), lambda: 1, lambda: len(_c))
-            # _n_c = tf.reduce_sum(tf.gather(self.x, _c), axis=0) / s
-
-            _n_c = tf.reduce_mean(tf.gather(self.x, _c_i), axis=0)
+            _c_i = tf.where(tf.equal(self._nearest(self._x, c), _i))
+            _n_c = tf.reduce_mean(tf.gather(self._x, _c_i), axis=0)
             _c = tf.concat((_c, _n_c), axis=0)
 
             return _i + 1, _c
 
-        _c_i_0 = tf.where(tf.equal(self._nearest(self.x, c), 0))
-        _c_0 = tf.reduce_mean(tf.gather(self.x, _c_i_0), axis=0)
+        _c_i_0 = tf.where(tf.equal(self._nearest(self._x, c), 0))
+        _c_0 = tf.reduce_mean(tf.gather(self._x, _c_i_0), axis=0)
         _c_0 = tf.reshape(_c_0, shape=[1, self._dim])
 
         _, n_c, = tf.while_loop(
@@ -399,7 +400,43 @@ class KMeans(Clustering):
         """Calculates the mean shift vector and refreshes the centroids.
            This method also fragments the data, since it was determined to
            be excessively large."""
-        raise NotImplementedError
+        def step_centroid(_i, _c):
+            """Moves the centroid to the cluster mean."""
+            _c_i = []
+            for _x_sh in self._x:
+                _c_i.append(tf.reshape(tf.where(
+                    tf.equal(self._nearest(_x_sh, c), _i)), shape=[-1, 1]))
+            _c_i = tf.reshape(tf.concat(_c_i, axis=0), [self._size, 1])
+            _n_c = tf.reduce_mean(tf.gather(self.x, _c_i), axis=0)
+            _c = tf.concat((_c, _n_c), axis=0)
+
+            return _i + 1, _c
+
+        _c_i_0 = []
+        for _x_sh_0 in self._x:
+            _c_i_0.append(tf.reshape(tf.where(
+                tf.equal(self._nearest(_x_sh_0, c), 0)), shape=[-1, 1]))
+        _c_i_0 = tf.reshape(tf.concat(_c_i_0, axis=0), [self._size, 1])
+        _c_0 = tf.reduce_mean(tf.gather(self.x, _c_i_0), axis=0)
+        _c_0 = tf.reshape(_c_0, shape=[1, self._dim])
+
+        _, n_c, = tf.while_loop(
+            cond=lambda _i, __c: tf.less(_i, self._n_clusters),
+            body=step_centroid,
+            loop_vars=(
+                tf.constant(1, dtype=tf.int32),
+                _c_0),
+            swap_memory=True,
+            parallel_iterations=self._n_parallel,
+            shape_invariants=(
+                tf.TensorShape([]),
+                tf.TensorShape([None, self._dim])))
+
+        n_c = tf.reshape(n_c, shape=[self._n_clusters, self._dim])
+        diff = tf.reshape(tf.reduce_max(
+            tf.sqrt(tf.reduce_sum((n_c - c) ** 2, axis=1))), [])
+
+        return i + 1, n_c, c_h, diff
 
     def _create_fit_graph(self):
         """Creates the computation graph of the clustering."""
@@ -407,16 +444,11 @@ class KMeans(Clustering):
         self._i_c = tf.placeholder(tf.float32, [self._n_clusters, self._dim])
 
         if self._sharded:
-            # Sharded version of expanded x and x.T
-            self._x_t = [tf.expand_dims(_x_t, 0)
-                         for _x_t in tf.split(tf.transpose(self.x),
-                                              self._n_shards, 1)]
-            self._x = [tf.expand_dims(_x, 0)
-                       for _x in tf.split(self.x, self._n_shards, 0)]
+            # Sharded version of expanded x
+            self._x = [_x for _x in tf.split(self.x, self._n_shards, 0)]
         else:
             # Normal version of expanded x and x.T
-            self._x_t = tf.expand_dims(tf.transpose(self.x), 0)
-            self._x = tf.expand_dims(self.x, 0)
+            self._x = self.x
 
         _c_h = tf.TensorArray(dtype=tf.float32, size=self._max_iter)
         _c_h = _c_h.write(0, self._i_c)
@@ -424,7 +456,7 @@ class KMeans(Clustering):
         _c = self._i_c
         kmeans = self._kmeans if not self._sharded else self._sharded_kmeans
 
-        self.n_iter_, _c, _c_h, self.m_diff_ = tf.while_loop(
+        self.n_iter_, cluster_op, _c_h, self.m_diff_ = tf.while_loop(
             cond=lambda __i, __c, __c_h, diff: tf.less(self._criterion, diff),
             body=kmeans,
             loop_vars=(
@@ -432,15 +464,23 @@ class KMeans(Clustering):
                 _c,
                 _c_h,
                 tf.constant(np.inf, tf.float32)),
-            maximum_iterations=self._max_iter)
+            maximum_iterations=self._max_iter - 1)
 
         r = 1 if self._sharded else self.n_iter_ + 1
         _c_h = _c_h.gather(tf.range(r))
+        hist_op = tf.cond(
+            tf.equal(self.n_iter_, self._max_iter - 1),
+            lambda: tf.Print(_c_h, [self.n_iter_],
+                             message='Stopping at maximum iterations limit.'),
+            lambda: _c_h)
 
-        return _c, _c_h
+        return cluster_op, hist_op
 
     def _pre_process(self, x, sess):
         """Chooses K random points from the data as initial centroids."""
+        assert len(x) >= self._n_clusters, 'Too few data points. K must ' \
+                                           'be smaller or equal than the ' \
+                                           'number of data points.'
         idx = np.arange(len(x))
         np.random.shuffle(idx)
         return x[idx[:self._n_clusters]]
@@ -456,11 +496,10 @@ class KMeans(Clustering):
 class MiniBatchKMeans(KMeans):
     """Implementation of the batched version of K-Means clustering."""
 
-    def __init__(self, dim: int,
-                 batch_size: int,
+    def __init__(self, batch_size: int,
                  n_clusters: int,
                  criterion: float = 1e-5,
-                 max_iter: int = 100):
+                 max_iter: int = 5000):
         """MiniBatchKMeans clustering object.
 
         Arguments:
@@ -469,31 +508,33 @@ class MiniBatchKMeans(KMeans):
             :param criterion: Convergence criterion.
             :param max_iter: Maximum number of iterations.
         """
-        super(MiniBatchKMeans, self).__init__(dim, n_clusters, criterion,
+        super(MiniBatchKMeans, self).__init__(n_clusters, criterion,
                                               max_iter)
 
+        assert batch_size is not None
+
         self._batch_size = batch_size
-        self._x_b = None
         self._idx = None
+
+    def _pre_process(self, x, sess):
+        """Chooses K random points from the data as initial centroids."""
+        self._idx = tf.range(self._size, dtype=tf.int32)
+        return super()._pre_process(x, sess)
 
     def _kmeans(self, i, c, c_h, _):
         """Calculates the next position of the cluster centroids."""
-
         def step_centroid(_i, _c):
             """Moves the centroid to the cluster mean."""
-            _c_i = tf.where(tf.equal(self._nearest(self._x_b, c), _i))
-            # TODO null check
-            # s = tf.cond(tf.equal(len(_c), 0), lambda: 1, lambda: len(_c))
-            # _n_c = tf.reduce_sum(tf.gather(self.x, _c), axis=0) / s
-
-            _n_c = tf.reduce_mean(tf.gather(self.x, _c_i), axis=0)
+            _c_i = tf.where(tf.equal(self._nearest(x_b, c), _i))
+            _n_c = tf.reduce_mean(tf.gather(x_b, _c_i), axis=0)
             _c = tf.concat((_c, _n_c), axis=0)
 
             return _i + 1, _c
 
-        self._idx = tf.random_shuffle(self._idx, )
-        _c_i_0 = tf.where(tf.equal(self._nearest(self._x_b, c), 0))
-        _c_0 = tf.reduce_mean(tf.gather(self._x_b, _c_i_0), axis=0)
+        idx = tf.random_shuffle(self._idx)
+        x_b = tf.gather(self.x, idx[:self._batch_size])
+        _c_i_0 = tf.where(tf.equal(self._nearest(x_b, c), 0))
+        _c_0 = tf.reduce_mean(tf.gather(x_b, _c_i_0), axis=0)
         _c_0 = tf.reshape(_c_0, shape=[1, self._dim])
 
         _, n_c, = tf.while_loop(
@@ -502,6 +543,8 @@ class MiniBatchKMeans(KMeans):
             loop_vars=(
                 tf.constant(1, dtype=tf.int32),
                 _c_0),
+            swap_memory=True,
+            parallel_iterations=self._n_parallel,
             shape_invariants=(
                 tf.TensorShape([]),
                 tf.TensorShape([None, self._dim])))
@@ -510,12 +553,14 @@ class MiniBatchKMeans(KMeans):
         diff = tf.reshape(tf.reduce_max(
             tf.sqrt(tf.reduce_sum((n_c - c) ** 2, axis=1))), [])
 
-        c_h = c_h.write(i + 1, n_c)
+        if not self._sharded:
+            c_h = c_h.write(i + 1, n_c)
 
         return i + 1, n_c, c_h, diff
 
     def _sharded_kmeans(self, i, c, c_h, _):
-        raise NotImplementedError
+        """Sharded implementation is not required for batched version."""
+        return self._kmeans(i, c, c_h, _)
 
 
 def _query_memory():
