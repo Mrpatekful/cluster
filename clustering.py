@@ -2,17 +2,21 @@
 
 """
 
-import tensorflow as tf
-import numpy as np
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 
 from tensorflow.python.client import device_lib
+
+import tensorflow as tf
+import numpy as np
 
 
 class Clustering:
     """Abstract base class for clustering algorithms."""
 
     @staticmethod
-    def _nearest(a, b):
+    def _distance_argmin(a, b):
         """Finds the indexes of the closest point (Euclidean) for each point in
         tensor 'a' from the points of tensor 'b'."""
         return tf.cast(tf.argmin(
@@ -29,12 +33,16 @@ class Clustering:
         self.centroids_ = None
         self.history_ = None
         self.n_iter_ = None
-        self.m_diff_ = None
+        self.max_diff_ = None
 
         # Initial centroids
-        self._i_c = None
+        self._initial_centroids = None
 
+        # Data set
         self.x = None
+
+        # Expanded version of the data
+        self._X = None
 
         # Number of shards
         self._n_shards = None
@@ -78,7 +86,8 @@ class Clustering:
             :param x: 2D Numpy array, that contains the data set.
 
         Returns:
-            :return _y: List of labels, in the same order as the provided data.
+            :return labels: List of labels, in the same order as the
+                    provided data.
         """
         self._dim = x.shape[1]
 
@@ -89,33 +98,38 @@ class Clustering:
         with tf.Session(config=config) as sess:
             self._size = x.shape[0]
 
-            c = self._pre_process(x, sess)
+            initial_centroids = self._pre_process(x, sess)
 
             self._sharded, self._n_shards = \
-                _prepare_shards(x.shape[0], x.shape[1], c.shape[0])
+                _prepare_shards(x.shape[0], x.shape[1],
+                                initial_centroids.shape[0])
             if self._sharded:
                 tf.logging.info('Data is too large, dividing to {} fragments.'.
                                 format(self._n_shards))
 
-            _c, self.history_, it, diff = sess.run(
-                [*self._create_fit_graph(), self.n_iter_, self.m_diff_],
+            cluster_op, hist_op = self._create_fit_graph()
+            tf.summary.FileWriter('tensorboard', sess.graph)
+
+            centroids, self.history_, n_iter, max_diff = sess.run(
+                [cluster_op, hist_op, self.n_iter_, self.max_diff_],
                 feed_dict={
-                    self.x:    x,
-                    self._i_c: c
-                })
+                    self.x: x,
+                    self._initial_centroids: initial_centroids
+                }
+            )
 
             tf.logging.info('Clustering finished in {} iterations with '
-                            '{:.5} shift delta.'.format(it, diff))
+                            '{:.5} shift delta.'.format(n_iter, max_diff))
             tf.logging.info('Proceeding to post-processing.')
-            _y, self.centroids_ = self._post_process(x, _c, sess)
+            labels, self.centroids_ = self._post_process(x, centroids, sess)
 
-        return _y
+        return labels
 
     def _create_predict_graph(self):
         """Creates the prediction computation graph."""
         self.x = tf.placeholder(tf.float32, [None, self._dim], name='data')
         _c = tf.constant(self.centroids_, dtype=tf.float32, name='centroids')
-        pred_op = self._nearest(self.x, _c)
+        pred_op = self._distance_argmin(self.x, _c)
 
         return pred_op
 
@@ -161,7 +175,7 @@ def _epanechnikov(x, x_i, h):
                        tf.cast(tf.less(norm, 1), tf.float32))
 
 
-def _uniform(x, x_i, h):
+def _flat(x, x_i, h):
     """Flat kernel function. If the value is within the bounds of
     the bandwidth, it gets weight 1, otherwise 0."""
     return tf.cast(tf.less(
@@ -174,7 +188,7 @@ class MeanShift(Clustering):
     # Available kernel functions
     _kernel_fns = {
         'gaussian':     _gaussian,
-        'uniform':      _uniform,
+        'flat':         _flat,
         'epanechnikov': _epanechnikov
     }
 
@@ -198,93 +212,122 @@ class MeanShift(Clustering):
         assert bandwidth is not None
 
         self._kernel_fn = self._kernel_fns[kernel]
-        self._bandwidth = bandwidth
         self._log_freq = max_iter // 20 if max_iter > 10 else 1
 
         # Bandwidth
-        self._h = None
+        self._bandwidth = bandwidth
 
-        self._x = None
-        self._x_t = None
+        # Transpose of expanded version of the provided data
+        self._X_T = None
 
+        # Size of the provided data
         self._size = None
+        self._indices = None
 
-    def _mean_shift(self, i, c, c_h, _):
-        """Calculates the mean shift vector and refreshes the centroids."""
-        ms = self._kernel_fn(tf.expand_dims(c, 2), self._x_t, self._h)
-        # New centroids
-        n_c = tf.reduce_sum(tf.expand_dims(ms, 2) * self._x, axis=1) / \
+    def _continuous_mean_shift(self, index, centroids, history, _):
+        """Calculates the mean shift vector and refreshes the centroids.
+        This method"""
+        ms = self._kernel_fn(tf.expand_dims(centroids, 2),
+                             self._X_T, self._bandwidth)
+
+        new_centroids = tf.reduce_sum(
+            tf.expand_dims(ms, 2) * self._X, axis=1) / \
             tf.reduce_sum(ms, axis=1, keepdims=True)
-        diff = tf.reshape(tf.reduce_max(
-            tf.sqrt(tf.reduce_sum((n_c - c) ** 2, axis=1))), [])
+        max_diff = tf.reshape(tf.reduce_max(
+            tf.sqrt(tf.reduce_sum(
+                (new_centroids - centroids) ** 2, axis=1))), [])
 
-        c_h = c_h.write(i + 1, n_c)
+        history = history.write(index + 1, new_centroids)
 
-        return i + 1, n_c, c_h, diff
+        return index + 1, new_centroids, history, max_diff
 
-    def _sharded_mean_shift(self, i, c, c_h, _):
+    def _discrete_mean_shift(self, index, centroids, history, _):
         """Calculates the mean shift vector and refreshes the centroids.
            This method also fragments the data, since it was determined to
            be excessively large."""
-        c_sh = tf.split(c, self._n_shards, 0)
-        # New (sharded) centroids
-        n_c = []
-        for _x, _x_t, _c in zip(self._x, self._x_t, c_sh):
-            _ms = self._kernel_fn(tf.expand_dims(_c, 2), _x_t, self._h)
-            n_c.append(tf.reduce_sum(tf.expand_dims(_ms, 2) * _x, axis=1) /
-                       tf.reduce_sum(_ms, axis=1, keepdims=True))
+        def shift_fragment(_index, _centroids):
+            _ms = self._kernel_fn(
+                tf.gather(self._X_T, _index),
+                tf.expand_dims(self._sharded_centroids, 2), self._bandwidth)
+            _centroids = _centroids.write(
+                _index,
+                tf.reduce_sum(tf.expand_dims(_ms, 2) *
+                              tf.gather(self._X, _index), axis=1) /
+                tf.reduce_sum(_ms, axis=1, keepdims=True))
 
-        n_c = tf.stack(tf.reshape(n_c, [self._size, self._dim]))
-        n_c = tf.cond(
-            tf.equal(i % self._log_freq, 0),
-            lambda: tf.Print(n_c, [i], message='Iteration: '),
-            lambda: n_c)
-        diff = tf.reshape(tf.reduce_max(
-            tf.sqrt(tf.reduce_sum((n_c - c) ** 2, axis=1))), [])
+            return _index + 1, _centroids
 
-        return i + 1, n_c, c_h, diff
+        _, new_centroids = tf.while_loop(
+            cond=lambda i, _: tf.less(i, self._n_shards),
+            body=shift_fragment,
+            loop_vars=(
+                tf.constant(0, dtype=tf.int32),
+                tf.TensorArray(dtype=tf.float32, size=self._n_shards)))
+
+        new_centroids = tf.reshape(
+            new_centroids.gather(
+                tf.range(self._n_shards)), [self._size, self._dim])
+        new_centroids = tf.cond(
+            tf.equal(index % self._log_freq, 0),
+            lambda: tf.Print(new_centroids, [index],
+                             message='Iteration: '),
+            lambda: new_centroids)
+        max_diff = tf.reshape(tf.reduce_max(
+            tf.sqrt(tf.reduce_sum(
+                (new_centroids - centroids) ** 2, axis=1))), [])
+
+        return index + 1, new_centroids, history, max_diff
 
     def _create_fit_graph(self):
         """Creates the computation graph of the clustering."""
         self.x = tf.placeholder(tf.float32, [self._size, self._dim])
-        self._i_c = tf.placeholder(tf.float32, [self._size, self._dim])
+        self._initial_centroids = \
+            tf.placeholder(tf.float32, [self._size, self._dim])
 
         if self._sharded:
             # Sharded version of expanded x and x.T
-            self._x_t = [tf.expand_dims(_x_t, 0)
+            self._X_T = [tf.expand_dims(_x_t, 0)
                          for _x_t in tf.split(tf.transpose(self.x),
                                               self._n_shards, 1)]
-            self._x = [tf.expand_dims(_x, 0)
+            self._X = [tf.expand_dims(_x, 0)
                        for _x in tf.split(self.x, self._n_shards, 0)]
+            self._sharded_centroids = tf.gather(self.x, tf.random_shuffle(
+                np.arange(self._size))[:self._size // self._n_shards])
+
         else:
             # Normal version of expanded x and x.T
-            self._x_t = tf.expand_dims(tf.transpose(self.x), 0)
-            self._x = tf.expand_dims(self.x, 0)
+            self._X_T = tf.expand_dims(tf.transpose(self.x), 0)
+            self._X = tf.expand_dims(self.x, 0)
 
-        self._h = tf.constant(self._bandwidth, tf.float32)
+        self._bandwidth = tf.constant(self._bandwidth, tf.float32)
 
-        _c_h = tf.TensorArray(dtype=tf.float32, size=self._max_iter)
-        _c_h = _c_h.write(0, self._i_c)
+        history = tf.TensorArray(dtype=tf.float32, size=self._max_iter)
+        history = history.write(0, self._initial_centroids)
 
-        self.m_diff_ = tf.constant(np.inf, tf.float32)
+        self.max_diff_ = tf.constant(np.inf, tf.float32)
+        centroids = self._initial_centroids
 
-        _c = self._i_c
-        mean_shift = self._mean_shift if not self._sharded else \
-            self._sharded_mean_shift
+        mean_shift = self._continuous_mean_shift if not self._sharded else \
+            self._discrete_mean_shift
 
-        self.n_iter_, cluster_op, _c_h, self.m_diff_ = tf.while_loop(
-            cond=lambda __i, __c, __c_h, diff: tf.less(self._criterion, diff),
+        self.n_iter_, cluster_op, history, self.max_diff_ = tf.while_loop(
+            cond=lambda i, c, h, diff: tf.less(self._criterion, diff),
             body=mean_shift,
             loop_vars=(
                 tf.constant(0, tf.int32),
-                _c,
-                _c_h,
-                self.m_diff_),
+                centroids,
+                history,
+                self.max_diff_),
             swap_memory=True,
             maximum_iterations=self._max_iter - 1)
 
         r = 1 if self._sharded else self.n_iter_ + 1
-        hist_op = _c_h.gather(tf.range(r))
+        history = history.gather(tf.range(r))
+        hist_op = tf.cond(
+            tf.equal(self.n_iter_, self._max_iter - 1),
+            lambda: tf.Print(history, [self.n_iter_],
+                             message='Stopping at maximum iterations limit.'),
+            lambda: history)
 
         return cluster_op, hist_op
 
@@ -294,26 +337,32 @@ class MeanShift(Clustering):
 
     def _post_process(self, _, y, sess):
         """Converts the tensor of converged data points to clusters."""
-        def process_point(_i, _c, _n_c, _l):
+        def process_point(index, _centroids, num_centroids, _labels):
             """Body of the while loop."""
-            def _new(_l, _lt, _cp, n):
+            def _new(label, __labels, __centroids, _num_centroids):
                 """Convenience function for adding new centroid."""
-                _cp = tf.concat([_cp, tf.expand_dims(y[_i], 0)], axis=0)
-                return _lt.write(_i, _l + 1), _cp, n + 1
+                _cp = tf.concat([__centroids,
+                                 tf.expand_dims(y[index], 0)], axis=0)
+                return __labels.write(index, label + 1), _cp,\
+                    _num_centroids + 1
 
-            def _exists(_l, _lt, _cp, n):
+            def _exists(label, __labels, __centroids, _num_centroids):
                 """Convenience function for labeling."""
-                return _lt.write(_i, _l), _cp, n
+                return __labels.write(index, label), __centroids, \
+                    _num_centroids
 
-            distance = tf.sqrt(tf.reduce_sum((_c - y[_i]) ** 2, axis=1))
-            least = tf.cast(tf.argmin(distance), tf.int32)
-            value = tf.gather(distance, least)
-            _l, _c, _n_c = tf.cond(
+            distance = tf.sqrt(tf.reduce_sum(
+                (_centroids - y[index]) ** 2, axis=1))
+            closest_index = tf.cast(tf.argmin(distance), tf.int32)
+            value = tf.gather(distance, closest_index)
+            _labels, _centroids, num_centroids = tf.cond(
                 tf.less(value, self._bandwidth * tolerance),
-                lambda: _exists(least, _l, _c, _n_c),
-                lambda: _new(_n_c, _l, _c, _n_c))
+                lambda: _exists(closest_index,
+                                _labels, _centroids, num_centroids),
+                lambda: _new(num_centroids, _labels, _centroids,
+                             num_centroids))
 
-            return _i + 1, _c, _n_c, _l
+            return index + 1, _centroids, num_centroids, _labels
 
         tolerance = 1.2
         _initial = y[None, 0]
@@ -322,11 +371,11 @@ class MeanShift(Clustering):
         # Loop variables:
         #  1. i: Index variable.
         #  2. c: Tensor of discovered centroids (modes).
-        #  3. n_c: Number of discovered centroids.
+        #  3. nc: Number of discovered centroids.
         #  4. l: TensorArray of labeled data.
 
-        _, _centroids, _, _labels = tf.while_loop(
-            cond=lambda __i, __c, __n_c, __l: tf.less(__i, self._size),
+        _, centroids, _, labels = tf.while_loop(
+            cond=lambda i, c, nc, l: tf.less(i, self._size),
             body=process_point,
             loop_vars=(
                 tf.constant(1, dtype=tf.int32),
@@ -339,10 +388,34 @@ class MeanShift(Clustering):
                 tf.TensorShape([]),
                 tf.TensorShape([])))
 
-        _labels = _labels.gather(tf.range(self._size))
-        labels, centroids = sess.run([_labels, _centroids])
+        labels = labels.gather(tf.range(self._size))
+        labels, centroids = sess.run([labels, centroids])
 
         return labels, centroids
+
+    def _variable_bandwidth(self):
+        pass
+
+
+class DynamicMeanShift(MeanShift):
+    """Dynamic version of the mean shift clustering."""
+
+    def _continuous_mean_shift(self, index, centroids, history, _):
+        """Calculates the mean shift vector and refreshes the centroids."""
+        ms = self._kernel_fn(tf.expand_dims(centroids, 2),
+                             tf.expand_dims(tf.transpose(centroids), 0),
+                             self._bandwidth)
+
+        new_centroids = tf.reduce_sum(
+            tf.expand_dims(ms, 2) * tf.expand_dims(centroids, 0), axis=1) / \
+            tf.reduce_sum(ms, axis=1, keepdims=True)
+        max_diff = tf.reshape(tf.reduce_max(
+            tf.sqrt(tf.reduce_sum(
+                (new_centroids - centroids) ** 2, axis=1))), [])
+
+        history = history.write(index + 1, new_centroids)
+
+        return index + 1, new_centroids, history, max_diff
 
 
 class KMeans(Clustering):
@@ -364,115 +437,130 @@ class KMeans(Clustering):
         self._n_clusters = n_clusters
         self._n_parallel = 1 if self._sharded else 10
 
-    def _kmeans(self, i, c, c_h, _):
+    def _kmeans(self, index, centroids, history, _):
         """Calculates the next position of the cluster centroids."""
-        def step_centroid(_i, _c):
+        def step_centroid(_index, _centroids):
             """Moves the centroid to the cluster mean."""
-            _c_i = tf.where(tf.equal(self._nearest(self._x, c), _i))
-            _n_c = tf.reduce_mean(tf.gather(self._x, _c_i), axis=0)
-            _c = tf.concat((_c, _n_c), axis=0)
+            _centroid_index = tf.where(
+                tf.equal(self._distance_argmin(self._X, centroids), _index))
+            _centroid = tf.reduce_mean(
+                tf.gather(self._X, _centroid_index), axis=0)
+            _centroids = tf.concat((_centroids, _centroid), axis=0)
 
-            return _i + 1, _c
+            return _index + 1, _centroids
 
-        _c_i_0 = tf.where(tf.equal(self._nearest(self._x, c), 0))
-        _c_0 = tf.reduce_mean(tf.gather(self._x, _c_i_0), axis=0)
-        _c_0 = tf.reshape(_c_0, shape=[1, self._dim])
+        _centroid_index_0 = tf.where(
+            tf.equal(self._distance_argmin(self._X, centroids), 0))
+        _centroid_0 = tf.reduce_mean(
+            tf.gather(self._X, _centroid_index_0), axis=0)
+        _centroid_0 = tf.reshape(_centroid_0, shape=[1, self._dim])
 
-        _, n_c, = tf.while_loop(
-            cond=lambda _i, __c: tf.less(_i, self._n_clusters),
+        _, new_centroids, = tf.while_loop(
+            cond=lambda i, c: tf.less(i, self._n_clusters),
             body=step_centroid,
             loop_vars=(
                 tf.constant(1, dtype=tf.int32),
-                _c_0),
+                _centroid_0),
             shape_invariants=(
                 tf.TensorShape([]),
                 tf.TensorShape([None, self._dim])))
 
-        n_c = tf.reshape(n_c, shape=[self._n_clusters, self._dim])
-        diff = tf.reshape(tf.reduce_max(
-            tf.sqrt(tf.reduce_sum((n_c - c) ** 2, axis=1))), [])
+        new_centroids = tf.reshape(
+            new_centroids, shape=[self._n_clusters, self._dim])
+        max_diff = tf.reshape(tf.reduce_max(
+            tf.sqrt(tf.reduce_sum(
+                (new_centroids - centroids) ** 2, axis=1))), [])
 
-        c_h = c_h.write(i + 1, n_c)
+        history = history.write(index + 1, new_centroids)
 
-        return i + 1, n_c, c_h, diff
+        return index + 1, new_centroids, history, max_diff
 
-    def _sharded_kmeans(self, i, c, c_h, _):
+    def _cached_kmeans(self, index, centroids, history, _):
         """Calculates the mean shift vector and refreshes the centroids.
            This method also fragments the data, since it was determined to
            be excessively large."""
-        def step_centroid(_i, _c):
+        def step_centroid(_index, _centroids):
             """Moves the centroid to the cluster mean."""
-            _c_i = []
-            for _x_sh in self._x:
-                _c_i.append(tf.reshape(tf.where(
-                    tf.equal(self._nearest(_x_sh, c), _i)), shape=[-1, 1]))
-            _c_i = tf.reshape(tf.concat(_c_i, axis=0), [self._size, 1])
-            _n_c = tf.reduce_mean(tf.gather(self.x, _c_i), axis=0)
-            _c = tf.concat((_c, _n_c), axis=0)
+            _sharded_centroid_index = []
+            for _x_sh in self._X:
+                _sharded_centroid_index.append(tf.reshape(tf.where(
+                    tf.equal(self._distance_argmin(_x_sh, centroids), _index)),
+                    shape=[-1, 1]))
+            _centroid_index = tf.reshape(
+                tf.concat(_sharded_centroid_index, axis=0), [self._size, 1])
+            _centroid = \
+                tf.reduce_mean(tf.gather(self.x, _centroid_index), axis=0)
+            _centroids = tf.concat((_centroids, _centroid), axis=0)
 
-            return _i + 1, _c
+            return _index + 1, _centroids
 
-        _c_i_0 = []
-        for _x_sh_0 in self._x:
-            _c_i_0.append(tf.reshape(tf.where(
-                tf.equal(self._nearest(_x_sh_0, c), 0)), shape=[-1, 1]))
-        _c_i_0 = tf.reshape(tf.concat(_c_i_0, axis=0), [self._size, 1])
-        _c_0 = tf.reduce_mean(tf.gather(self.x, _c_i_0), axis=0)
-        _c_0 = tf.reshape(_c_0, shape=[1, self._dim])
+        sharded_centroid_index_0 = []
+        for _x_sh_0 in self._X:
+            sharded_centroid_index_0.append(tf.reshape(tf.where(
+                tf.equal(self._distance_argmin(_x_sh_0, centroids), 0)),
+                shape=[-1, 1]))
+        _centroid_index_0 = tf.reshape(
+            tf.concat(sharded_centroid_index_0, axis=0), [self._size, 1])
+        _centroid_0 = tf.reduce_mean(
+            tf.gather(self.x, _centroid_index_0), axis=0)
+        _centroid_0 = tf.reshape(_centroid_0, shape=[1, self._dim])
 
-        _, n_c, = tf.while_loop(
-            cond=lambda _i, __c: tf.less(_i, self._n_clusters),
+        _, new_centroids, = tf.while_loop(
+            cond=lambda i, c: tf.less(i, self._n_clusters),
             body=step_centroid,
             loop_vars=(
                 tf.constant(1, dtype=tf.int32),
-                _c_0),
+                _centroid_0),
             swap_memory=True,
             parallel_iterations=self._n_parallel,
             shape_invariants=(
                 tf.TensorShape([]),
                 tf.TensorShape([None, self._dim])))
 
-        n_c = tf.reshape(n_c, shape=[self._n_clusters, self._dim])
+        new_centroids = tf.reshape(
+            new_centroids, shape=[self._n_clusters, self._dim])
         diff = tf.reshape(tf.reduce_max(
-            tf.sqrt(tf.reduce_sum((n_c - c) ** 2, axis=1))), [])
+            tf.sqrt(tf.reduce_sum(
+                (new_centroids - centroids) ** 2, axis=1))), [])
 
-        return i + 1, n_c, c_h, diff
+        return index + 1, new_centroids, history, diff
 
     def _create_fit_graph(self):
         """Creates the computation graph of the clustering."""
         self.x = tf.placeholder(tf.float32, [self._size, self._dim])
-        self._i_c = tf.placeholder(tf.float32, [self._n_clusters, self._dim])
+        self._initial_centroids = \
+            tf.placeholder(tf.float32, [self._n_clusters, self._dim])
 
         if self._sharded:
             # Sharded version of expanded x
-            self._x = [_x for _x in tf.split(self.x, self._n_shards, 0)]
+            self._X = [_x for _x in tf.split(self.x, self._n_shards, 0)]
         else:
             # Normal version of expanded x and x.T
-            self._x = self.x
+            self._X = self.x
 
-        _c_h = tf.TensorArray(dtype=tf.float32, size=self._max_iter)
-        _c_h = _c_h.write(0, self._i_c)
+        history = tf.TensorArray(dtype=tf.float32, size=self._max_iter)
+        history = history.write(0, self._initial_centroids)
 
-        _c = self._i_c
-        kmeans = self._kmeans if not self._sharded else self._sharded_kmeans
+        centroids = self._initial_centroids
+        kmeans = self._kmeans if not self._sharded else self._cached_kmeans
 
-        self.n_iter_, cluster_op, _c_h, self.m_diff_ = tf.while_loop(
-            cond=lambda __i, __c, __c_h, diff: tf.less(self._criterion, diff),
+        self.n_iter_, cluster_op, history, self.max_diff_ = tf.while_loop(
+            cond=lambda i, c, h, diff: tf.less(self._criterion, diff),
             body=kmeans,
             loop_vars=(
                 tf.constant(0, tf.int32),
-                _c,
-                _c_h,
+                centroids,
+                history,
                 tf.constant(np.inf, tf.float32)),
             maximum_iterations=self._max_iter - 1)
 
         r = 1 if self._sharded else self.n_iter_ + 1
-        _c_h = _c_h.gather(tf.range(r))
+        history = history.gather(tf.range(r))
         hist_op = tf.cond(
             tf.equal(self.n_iter_, self._max_iter - 1),
-            lambda: tf.Print(_c_h, [self.n_iter_],
+            lambda: tf.Print(history, [self.n_iter_],
                              message='Stopping at maximum iterations limit.'),
-            lambda: _c_h)
+            lambda: history)
 
         return cluster_op, hist_op
 
@@ -481,15 +569,16 @@ class KMeans(Clustering):
         assert len(x) >= self._n_clusters, 'Too few data points. K must ' \
                                            'be smaller or equal than the ' \
                                            'number of data points.'
-        idx = np.arange(len(x))
-        np.random.shuffle(idx)
-        return x[idx[:self._n_clusters]]
+        data_indices = np.arange(len(x))
+        np.random.shuffle(data_indices)
+        return x[data_indices[:self._n_clusters]]
 
     def _post_process(self, x, y, sess):
         """No post processing is needed, returning with the centroids,
         and data labels."""
         _y = tf.constant(y, dtype=tf.float32)
-        labels = sess.run(self._nearest(self.x, _y), feed_dict={self.x: x})
+        labels = sess.run(self._distance_argmin(self.x, _y),
+                          feed_dict={self.x: x})
         return labels, y
 
 
@@ -503,7 +592,6 @@ class MiniBatchKMeans(KMeans):
         """MiniBatchKMeans clustering object.
 
         Arguments:
-            :param dim: Dimensionality of the data point vectors.
             :param n_clusters: The number of clusters (K parameter).
             :param criterion: Convergence criterion.
             :param max_iter: Maximum number of iterations.
@@ -514,53 +602,62 @@ class MiniBatchKMeans(KMeans):
         assert batch_size is not None
 
         self._batch_size = batch_size
-        self._idx = None
+        self._data_indices = None
 
     def _pre_process(self, x, sess):
         """Chooses K random points from the data as initial centroids."""
-        self._idx = tf.range(self._size, dtype=tf.int32)
+        self._data_indices = tf.range(self._size, dtype=tf.int32)
         return super()._pre_process(x, sess)
 
-    def _kmeans(self, i, c, c_h, _):
+    def _kmeans(self, index, centroids, history, _):
         """Calculates the next position of the cluster centroids."""
-        def step_centroid(_i, _c):
+        def step_centroid(_index, _c):
             """Moves the centroid to the cluster mean."""
-            _c_i = tf.where(tf.equal(self._nearest(x_b, c), _i))
-            _n_c = tf.reduce_mean(tf.gather(x_b, _c_i), axis=0)
+            _c_i = tf.where(
+                tf.equal(self._distance_argmin(batch, centroids), _index))
+            _n_c = tf.reduce_mean(tf.gather(batch, _c_i), axis=0)
             _c = tf.concat((_c, _n_c), axis=0)
 
-            return _i + 1, _c
+            return _index + 1, _c
 
-        idx = tf.random_shuffle(self._idx)
-        x_b = tf.gather(self.x, idx[:self._batch_size])
-        _c_i_0 = tf.where(tf.equal(self._nearest(x_b, c), 0))
-        _c_0 = tf.reduce_mean(tf.gather(x_b, _c_i_0), axis=0)
-        _c_0 = tf.reshape(_c_0, shape=[1, self._dim])
+        shuffled_data_indices = tf.random_shuffle(self._data_indices)
+        batch = tf.gather(self.x, shuffled_data_indices[:self._batch_size])
+        _centroid_index_0 = tf.where(
+            tf.equal(self._distance_argmin(batch, centroids), 0))
+        _centroid_0 = tf.reduce_mean(
+            tf.gather(batch, _centroid_index_0), axis=0)
+        _centroid_0 = tf.reshape(_centroid_0, shape=[1, self._dim])
 
-        _, n_c, = tf.while_loop(
-            cond=lambda _i, __c: tf.less(_i, self._n_clusters),
+        _, new_centroids, = tf.while_loop(
+            cond=lambda i, c: tf.less(i, self._n_clusters),
             body=step_centroid,
             loop_vars=(
                 tf.constant(1, dtype=tf.int32),
-                _c_0),
+                _centroid_0),
             swap_memory=True,
             parallel_iterations=self._n_parallel,
             shape_invariants=(
                 tf.TensorShape([]),
                 tf.TensorShape([None, self._dim])))
 
-        n_c = tf.reshape(n_c, shape=[self._n_clusters, self._dim])
+        new_centroids = tf.reshape(
+            new_centroids, shape=[self._n_clusters, self._dim])
         diff = tf.reshape(tf.reduce_max(
-            tf.sqrt(tf.reduce_sum((n_c - c) ** 2, axis=1))), [])
+            tf.sqrt(tf.reduce_sum(
+                (new_centroids - centroids) ** 2, axis=1))), [])
 
         if not self._sharded:
-            c_h = c_h.write(i + 1, n_c)
+            history = history.write(index + 1, new_centroids)
 
-        return i + 1, n_c, c_h, diff
+        return index + 1, new_centroids, history, diff
 
-    def _sharded_kmeans(self, i, c, c_h, _):
+    def _cached_kmeans(self, index, centroids, history, _):
         """Sharded implementation is not required for batched version."""
-        return self._kmeans(i, c, c_h, _)
+        return self._kmeans(index, centroids, history, _)
+
+
+def estimate_bandwidth():
+    pass
 
 
 def _query_memory():
