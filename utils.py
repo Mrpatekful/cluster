@@ -22,6 +22,14 @@ def save(path, data):
     np.save(file=path, arr=data)
 
 
+def remove_empty(dictionary):
+    """Removes empty entries from a dictionary."""
+    for key in list(dictionary.keys()):
+        if dictionary.get(key) is None:
+            del dictionary[key]
+    return dictionary
+
+
 def plot(history, data, labels, centroids, draw_lines=True):
     """Plots the result of clustering."""
 
@@ -32,7 +40,8 @@ def plot(history, data, labels, centroids, draw_lines=True):
     draw_line = np.vectorize(lambda p1, p2: _draw_line(p1, p2),
                              signature='(n),(n)->()')
 
-    grid = sns.jointplot(data[:, 0], data[:, 1], kind="kde", height=6)
+    grid = sns.jointplot(
+        data[:, 0], data[:, 1], kind="kde", height=6)
     grid.plot_joint(plt.scatter, c=labels, zorder=2)
 
     # Speeds up drawing by skipping several history objects
@@ -51,6 +60,7 @@ def plot(history, data, labels, centroids, draw_lines=True):
     plt.show()
 
 
+# noinspection PyProtectedMember
 def animation_to_html(animation):
     """Embeds animation in html."""
     video_tag = """<video controls>
@@ -109,11 +119,21 @@ def animated_plot(history, labels, show=True):
         return animation
 
 
-def generate_random(n_samples=50):
+def generate_random(n_samples=50, n_features=2):
     """Generates random samples."""
-    a = np.random.multivariate_normal([1, 1], [[1, 0], [0, 1]], [n_samples])
-    b = np.random.multivariate_normal([-3, -3], [[1, 0], [0, 1]], [n_samples])
-    c = np.random.multivariate_normal([-8, -3], [[1, 0], [0, 1]], [n_samples])
+    a = np.random.multivariate_normal(
+        [1] * n_features,
+        np.random.random([n_features, n_features]) * 5 + 1,
+        [n_samples])
+    b = np.random.multivariate_normal(
+        [-6] * n_features,
+        np.random.random([n_features, n_features]) * 5 + 1,
+        [n_samples])
+    c = np.random.multivariate_normal(
+        [11] * n_features,
+        np.random.random([n_features, n_features]) * 5 + 1,
+        [n_samples])
+
     data = np.vstack((a, b, c))
 
     return data

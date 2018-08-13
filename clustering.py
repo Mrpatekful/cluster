@@ -11,6 +11,8 @@ from tensorflow.python.client import device_lib
 import tensorflow as tf
 import numpy as np
 
+import os
+
 
 class Clustering:
     """Abstract base class for clustering algorithms."""
@@ -108,7 +110,8 @@ class Clustering:
                                 format(self._n_shards))
 
             cluster_op, hist_op = self._create_fit_graph()
-            tf.summary.FileWriter('tensorboard', sess.graph)
+            tf.summary.FileWriter(
+                os.path.join('tensorboard'), sess.graph)
 
             centroids, self.history_, n_iter, max_diff = sess.run(
                 [cluster_op, hist_op, self.n_iter_, self.max_diff_],
@@ -179,7 +182,7 @@ def _flat(x, x_i, h):
     """Flat kernel function. If the value is within the bounds of
     the bandwidth, it gets weight 1, otherwise 0."""
     return tf.cast(tf.less(
-        tf.linalg.norm((x - x_i) / h, ord=2, axis=1), 1), tf.float32)
+        tf.linalg.norm((x - x_i) / h, ord=2, axis=1), h), tf.float32)
 
 
 class MeanShift(Clustering):
@@ -224,7 +227,7 @@ class MeanShift(Clustering):
         self._size = None
         self._indices = None
 
-    def _continuous_mean_shift(self, index, centroids, history, _):
+    def _fast_mean_shift(self, index, centroids, history, _):
         """Calculates the mean shift vector and refreshes the centroids.
         This method"""
         ms = self._kernel_fn(tf.expand_dims(centroids, 2),
@@ -241,7 +244,7 @@ class MeanShift(Clustering):
 
         return index + 1, new_centroids, history, max_diff
 
-    def _discrete_mean_shift(self, index, centroids, history, _):
+    def _flat_mean_shift(self, index, centroids, history, _):
         """Calculates the mean shift vector and refreshes the centroids.
            This method also fragments the data, since it was determined to
            be excessively large."""
@@ -304,20 +307,19 @@ class MeanShift(Clustering):
         history = tf.TensorArray(dtype=tf.float32, size=self._max_iter)
         history = history.write(0, self._initial_centroids)
 
-        self.max_diff_ = tf.constant(np.inf, tf.float32)
         centroids = self._initial_centroids
 
-        mean_shift = self._continuous_mean_shift if not self._sharded else \
-            self._discrete_mean_shift
+        mean_shift = self._fast_mean_shift if not self._sharded else \
+            self._flat_mean_shift
 
         self.n_iter_, cluster_op, history, self.max_diff_ = tf.while_loop(
             cond=lambda i, c, h, diff: tf.less(self._criterion, diff),
             body=mean_shift,
             loop_vars=(
-                tf.constant(0, tf.int32),
+                tf.constant(0, dtype=tf.int32),
                 centroids,
                 history,
-                self.max_diff_),
+                tf.constant(np.inf, dtype=tf.float32)),
             swap_memory=True,
             maximum_iterations=self._max_iter - 1)
 
@@ -400,7 +402,7 @@ class MeanShift(Clustering):
 class DynamicMeanShift(MeanShift):
     """Dynamic version of the mean shift clustering."""
 
-    def _continuous_mean_shift(self, index, centroids, history, _):
+    def _fast_mean_shift(self, index, centroids, history, _):
         """Calculates the mean shift vector and refreshes the centroids."""
         ms = self._kernel_fn(tf.expand_dims(centroids, 2),
                              tf.expand_dims(tf.transpose(centroids), 0),
