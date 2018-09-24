@@ -1,8 +1,8 @@
 """
 
 @author:    Patrik Purgai
-@copyright: Copyright 2018, ClusterFlow
-@license:   MTA
+@copyright: Copyright 2018, tfcluster
+@license:   MIT
 @email:     purgai.patrik@gmail.com
 @date:      2018.08.17.
 """
